@@ -1,0 +1,49 @@
+import json
+from pathlib import Path
+from transformers import BertTokenizer
+import torch
+
+def GetDataLoader(dataset_path, max_input, tokenizer, max_seq_length=384):
+    with open(dataset_path, 'r') as f:
+        squad_data = json.load(f)['data']
+
+    tokenizer = BertTokenizer.from_pretrained('bert-large-uncased')
+
+    for article in squad_data:
+        for paragraph in article['paragraphs']:
+            context = paragraph['context']
+            question_answers = [(qa['question'], qa['answers'][0]['text']) for qa in paragraph['qas']]
+            for question, answer in question_answers[:max_input]:
+                inputs = tokenizer.encode_plus(
+                    question,
+                    context,
+                    add_special_tokens=True,
+                    max_length=max_seq_length,
+                    truncation=True,
+                    padding='max_length',
+                    return_tensors='pt'
+                )
+
+                input_ids = inputs["input_ids"].squeeze(0)
+                input_mask = inputs["attention_mask"].squeeze(0)
+                segment_ids = inputs["token_type_ids"].squeeze(0)
+
+                yield (
+                    input_ids,
+                    input_mask,
+                    segment_ids
+                )
+
+# Example usage
+if __name__ == "__main__":
+    dataset_path = 'path_to_squad_dataset/dev-v1.1.json'
+    max_input = 10  # Number of examples to process
+
+    tokenizer = BertTokenizer.from_pretrained('bert-large-uncased')
+
+    dataloader = GetDataLoader(dataset_path, max_input, tokenizer)
+
+    for input_ids, input_mask, segment_ids in dataloader:
+        print("Input IDs:", input_ids.shape)
+        print("Input Mask:", input_mask.shape)
+        print("Segment IDs:", segment_ids.shape)
