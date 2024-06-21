@@ -1,0 +1,59 @@
+import os
+import pickle
+from transformers import BertTokenizer
+from create_squad_data import read_squad_examples, convert_examples_to_features
+
+max_seq_length = 384
+max_query_length = 64
+doc_stride = 128
+
+class SquadDataProcessor:
+    def __init__(self, dataset_file, output_pkl, vocab_file, max_input=1):
+        self.dataset_file = dataset_file
+        self.output_pkl = output_pkl
+        self.vocab_file = vocab_file
+        self.max_input = max_input
+
+    def process_dataset(self):
+        print("Creating tokenizer...")
+        tokenizer = BertTokenizer(self.vocab_file)
+
+        print("Reading examples...")
+        eval_examples = read_squad_examples(input_file=self.dataset_file,
+                                            is_training=False, version_2_with_negative=False)
+
+        print("Converting examples to features...")
+        eval_features = []
+        for example in eval_examples:
+            features = convert_examples_to_features(
+                examples=[example],
+                tokenizer=tokenizer,
+                max_seq_length=max_seq_length,
+                doc_stride=doc_stride,
+                max_query_length=max_query_length,
+                is_training=False,
+                verbose_logging=False
+            )
+
+            # Extract input_ids, input_mask, segment_ids based on max_input
+            for feature in features[:self.max_input]:
+                input_ids = feature.input_ids
+                input_mask = feature.attention_mask
+                segment_ids = feature.token_type_ids
+                eval_features.append((input_ids, input_mask, segment_ids))
+
+        print(f"Saving features to '{self.output_pkl}'...")
+        with open(self.output_pkl, 'wb') as pkl_file:
+            pickle.dump(eval_features, pkl_file)
+
+        print("Processing completed.")
+
+
+if __name__ == "__main__":
+    dataset_file_path = "path_to_your_dataset_file.json"
+    output_pkl_path = "path_to_output_pkl_file.pkl"
+    vocab_file_path = "path_to_vocab_txt_file.txt"
+    max_input = 2  # Example: Change max_input based on command line argument
+
+    processor = SquadDataProcessor(dataset_file=dataset_file_path, output_pkl=output_pkl_path, vocab_file=vocab_file_path, max_input=max_input)
+    processor.process_dataset()
