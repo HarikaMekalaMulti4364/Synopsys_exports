@@ -1,0 +1,90 @@
+import onnxruntime as ort
+import numpy as np
+import json
+from typing import List, Dict, Tuple
+import torch
+from transformers import PreTrainedTokenizer
+from pathlib import Path
+from tqdm import tqdm
+
+class ONNXModelExecutor:
+    def __init__(self, model_path: str, dataset, postprocessing: Callable, tokenizer: PreTrainedTokenizer,
+                 cpu_cores: int = 1, output_path: Path = Path.cwd(), dump_raw_output: bool = False, skip_run: bool = False):
+        self.model_path = model_path
+        self.session = ort.InferenceSession(model_path)
+        self.dataset = dataset
+        self.postprocessing = postprocessing
+        self.tokenizer = tokenizer
+        self.cpu_cores = cpu_cores
+        self.output_path = output_path
+        self.dump_raw_output = dump_raw_output
+        self.skip_run = skip_run
+        self.path_to_raw_output = self.setup_folder_for_artifacts(output_path / "raw")
+
+    def prepare_input_data(self, input_object) -> Dict[str, np.ndarray]:
+        feed_dict = {}
+        for input_name in self.session.get_inputs():
+            input_name = input_name.name
+            input_data = input_object[input_name]
+            feed_dict[input_name] = np.array(input_data, dtype=np.float32)
+        return feed_dict
+
+    def postprocess(self, output_data: List[np.ndarray], input_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> str:
+        start_scores, end_scores = output_data
+        input_ids = input_data[0].cpu().numpy()
+        start_idx = np.argmax(start_scores, axis=1).item()
+        end_idx = np.argmax(end_scores, axis=1).item()
+        answer = self.tokenizer.decode(input_ids[start_idx:end_idx+1])
+        return answer
+
+    def _read_raw_output(self, input_id: str) -> List[np.ndarray]:
+        with open(self.path_to_raw_output / f"{input_id}.json", 'r') as file:
+            output_data = json.load(file)
+        return [np.array(output_layer) for output_layer in output_data]
+
+    def _dump_raw_output(self, input_id: str, output_data: List[np.ndarray]):
+        with open(self.path_to_raw_output / f"{input_id}.json", 'w') as file:
+            json.dump([output_layer.tolist() for output_layer in output_data], file)
+
+    def get_prediction(self, input_id: str, input_object: Dict[str, np.ndarray], input_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> Dict[str, str]:
+        if self.skip_run:
+            output_data = self._read_raw_output(input_id)
+        else:
+            feed_dict = self.prepare_input_data(input_object)
+            pred_dict = self.session.run(None, feed_dict)
+            output_data = [layer_data for layer_data in pred_dict]  # Remove batch dimension
+
+            if self.dump_raw_output:
+                self._dump_raw_output(input_id, output_data)
+
+        pred_postprocessed = self.postprocess(output_data, input_data)
+        return {input_id: pred_postprocessed}
+
+    def run(self) -> dict:
+        print("Input name:", self.session.get_inputs()[0].name)
+        print(f"Running {len(self.dataset)} inputs on {self.cpu_cores} cores")
+        postprocessed_results = []
+
+        with tqdm(total=len(self.dataset)) as progress_bar:
+            for input_name, input_data in self.dataset.forward():
+                postprocessed_output = self.get_prediction(input_name, input_data)
+                postprocessed_results.append(postprocessed_output)
+                progress_bar.update()
+
+        postprocessed_results_dict = {key: value for entry in postprocessed_results for key, value in entry.items()}
+        return postprocessed_results_dict
+
+    def setup_folder_for_artifacts(self, folder_path: Path) -> Path:
+        folder_path.mkdir(parents=True, exist_ok=True)
+        return folder_path
+
+# Example usage:
+# model_path = 'path_to_onnx_model.onnx'
+# dataset = YourDatasetClass(...)  # Initialize your dataset class
+# postprocessing_func = your_postprocessing_function  # Define your postprocessing function
+# tokenizer = PreTrainedTokenizer.from_pretrained('bert-base-uncased')
+
+# executor = ONNXModelExecutor(model_path, dataset, postprocessing_func, tokenizer)
+
+# results = executor.run()
+# print(results)
