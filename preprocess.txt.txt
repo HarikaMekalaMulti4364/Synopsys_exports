@@ -1,49 +1,243 @@
+import os
 import json
-from pathlib import Path
+import collections
 from transformers import BertTokenizer
-import torch
 
-def GetDataLoader(dataset_path, max_input, tokenizer, max_seq_length=384):
-    with open(dataset_path, 'r') as f:
-        squad_data = json.load(f)['data']
+class SquadPreprocessor:
+    def __init__(self, vocab_file='bert-base-uncased'):
+        self.tokenizer = BertTokenizer.from_pretrained(vocab_file)
 
-    tokenizer = BertTokenizer.from_pretrained('bert-large-uncased')
+    def preprocess(self, input_file, max_seq_length=384, doc_stride=128, max_query_length=64):
+        output_file = 'preprocessed_data.json'
 
-    for article in squad_data:
-        for paragraph in article['paragraphs']:
-            context = paragraph['context']
-            question_answers = [(qa['question'], qa['answers'][0]['text']) for qa in paragraph['qas']]
-            for question, answer in question_answers[:max_input]:
-                inputs = tokenizer.encode_plus(
-                    question,
-                    context,
-                    add_special_tokens=True,
-                    max_length=max_seq_length,
-                    truncation=True,
-                    padding='max_length',
-                    return_tensors='pt'
-                )
+        if os.path.exists(output_file):
+            with open(output_file, 'r') as f:
+                output_data = json.load(f)
+            input_ids_list = output_data["input_ids"]
+            input_mask_list = output_data["input_mask"]
+            segment_ids_list = output_data["segment_ids"]
+            eval_examples = output_data["eval_examples"]
+            eval_features = output_data["eval_features"]
+        else:
+            with open(input_file, 'r') as f:
+                input_data = json.load(f)['data']
 
-                input_ids = inputs["input_ids"].squeeze(0)
-                input_mask = inputs["attention_mask"].squeeze(0)
-                segment_ids = inputs["token_type_ids"].squeeze(0)
+            eval_examples = []
+            eval_features = []
+            input_ids_list = []
+            input_mask_list = []
+            segment_ids_list = []
 
-                yield (
-                    input_ids,
-                    input_mask,
-                    segment_ids
-                )
+            for entry in input_data:
+                for paragraph in entry['paragraphs']:
+                    context_text = paragraph['context']
+                    for qa in paragraph['qas']:
+                        question_text = qa['question']
+                        example, features, input_ids, input_mask, segment_ids = self.convert_example_to_features(
+                            question_text, context_text, max_seq_length, doc_stride, max_query_length)
+                        eval_examples.append(example)
+                        eval_features.extend(features)  # features is a list of feature dictionaries
+                        input_ids_list.append(input_ids)
+                        input_mask_list.append(input_mask)
+                        segment_ids_list.append(segment_ids)
 
-# Example usage
-if __name__ == "__main__":
-    dataset_path = 'path_to_squad_dataset/dev-v1.1.json'
-    max_input = 10  # Number of examples to process
+            output_data = {
+                "input_ids": input_ids_list,
+                "input_mask": input_mask_list,
+                "segment_ids": segment_ids_list,
+                "eval_examples": eval_examples,
+                "eval_features": eval_features
+            }
 
-    tokenizer = BertTokenizer.from_pretrained('bert-large-uncased')
+            with open(output_file, 'w') as f:
+                json.dump(output_data, f, indent=2)
 
-    dataloader = GetDataLoader(dataset_path, max_input, tokenizer)
+        self.eval_features = eval_features
+        return input_ids_list, input_mask_list, segment_ids_list, eval_examples, eval_features
 
-    for input_ids, input_mask, segment_ids in dataloader:
-        print("Input IDs:", input_ids.shape)
-        print("Input Mask:", input_mask.shape)
-        print("Segment IDs:", segment_ids.shape)
+    def convert_example_to_features(self, question, context, max_seq_length, doc_stride, max_query_length):
+        examples = {
+            "question": question,
+            "context": context
+        }
+        features = []
+
+        tok_to_orig_index = []
+        orig_to_tok_index = []
+        all_doc_tokens = []
+        for (i, token) in enumerate(context.split()):
+            orig_to_tok_index.append(len(all_doc_tokens))
+            sub_tokens = self.tokenizer.tokenize(token)
+            for sub_token in sub_tokens:
+                tok_to_orig_index.append(i)
+                all_doc_tokens.append(sub_token)
+
+        truncated_query = self.tokenizer.encode(
+            question, add_special_tokens=False, max_length=max_query_length, truncation=True)
+
+        max_tokens_for_doc = max_seq_length - len(truncated_query) - 3
+
+        _DocSpan = collections.namedtuple("DocSpan", ["start", "length"])
+        doc_spans = []
+        start_offset = 0
+        while start_offset < len(all_doc_tokens):
+            length = len(all_doc_tokens) - start_offset
+            if length > max_tokens_for_doc:
+                length = max_tokens_for_doc
+            doc_spans.append(_DocSpan(start=start_offset, length=length))
+            if start_offset + length == len(all_doc_tokens):
+                break
+            start_offset += min(length, doc_stride)
+
+        for (doc_span_index, doc_span) in enumerate(doc_spans):
+            tokens = []
+            token_to_orig_map = {}
+            token_is_max_context = {}
+            segment_ids = []
+            tokens.append("[CLS]")
+            segment_ids.append(0)
+            for token in truncated_query:
+                tokens.append(token)
+                segment_ids.append(0)
+            tokens.append("[SEP]")
+            segment_ids.append(0)
+
+            for i in range(doc_span.length):
+                split_token_index = doc_span.start + i
+                token_to_orig_map[len(tokens)] = tok_to_orig_index[split_token_index]
+
+                is_max_context = self._check_is_max_context(doc_spans, doc_span_index, split_token_index)
+                token_is_max_context[len(tokens)] = is_max_context
+                tokens.append(all_doc_tokens[split_token_index])
+                segment_ids.append(1)
+            tokens.append("[SEP]")
+            segment_ids.append(1)
+
+            input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+            input_mask = [1] * len(input_ids)
+
+            padding = [0] * (max_seq_length - len(input_ids))
+            input_ids += padding
+            input_mask += padding
+            segment_ids += padding
+
+            assert len(input_ids) == max_seq_length
+            assert len(input_mask) == max_seq_length
+            assert len(segment_ids) == max_seq_length
+
+            feature = {
+                "input_ids": input_ids,
+                "input_mask": input_mask,
+                "segment_ids": segment_ids,
+                "token_to_orig_map": token_to_orig_map,
+                "token_is_max_context": token_is_max_context,
+                "tokens": tokens
+            }
+            features.append(feature)
+
+        return examples, features, input_ids, input_mask, segment_ids
+
+    def _check_is_max_context(self, doc_spans, cur_span_index, position):
+        best_score = None
+        best_span_index = None
+        for (span_index, doc_span) in enumerate(doc_spans):
+            end = doc_span.start + doc_span.length - 1
+            if position < doc_span.start:
+                continue
+            if position > end:
+                continue
+            num_left_context = position - doc_span.start
+            num_right_context = end - position
+            score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
+            if best_score is None or score > best_score:
+                best_score = score
+                best_span_index = span_index
+        return best_span_index == cur_span_index
+
+    def get_features(self, sample_id):
+        return self.eval_features[sample_id]
+
+class SQuAD_v1_QSL:
+    def __init__(self, preprocessor, total_count_override=None, perf_count_override=None):
+        self.preprocessor = preprocessor
+        self.eval_features = preprocessor.eval_features
+        self.count = total_count_override or len(self.eval_features)
+        self.perf_count = perf_count_override or self.count
+        self.qsl = self.ConstructQSL(self.count, self.perf_count, self.load_query_samples, self.unload_query_samples)
+        print("Finished constructing QSL.")
+
+    def ConstructQSL(self, count, perf_count, load_func, unload_func):
+        # Dummy QSL constructor for demonstration purposes
+        return {
+            'count': count,
+            'perf_count': perf_count,
+            'load_func': load_func,
+            'unload_func': unload_func
+        }
+
+    def load_query_samples(self, sample_list):
+        # Placeholder for actual sample loading logic
+        pass
+
+    def unload_query_samples(self, sample_list):
+        # Placeholder for actual sample unloading logic
+        pass
+
+    def __del__(self):
+        print("Finished destroying QSL.")
+
+def get_squad_QSL(preprocessor, total_count_override=None, perf_count_override=None):
+    return SQuAD_v1_QSL(preprocessor, total_count_override, perf_count_override)
+
+class SUT:
+    def __init__(self, qsl):
+        print("Constructing SUT...")
+        self.qsl = qsl
+        self.sut = self.ConstructSUT(self.issue_queries, self.flush_queries)
+        print("Finished constructing SUT.")
+
+    def ConstructSUT(self, issue_func, flush_func):
+        # Dummy SUT constructor for demonstration purposes
+        return {
+            'issue_func': issue_func,
+            'flush_func': flush_func
+        }
+
+    def issue_queries(self, query_samples):
+        for i in range(len(query_samples)):
+            eval_features = self.qsl.get_features(query_samples[i]['index'])
+            self.process_sample(eval_features, query_samples[i]['id'])
+
+    def process_sample(self, sample_input, query_id=None):
+        input_ids = sample_input['input_ids']
+        input_mask = sample_input['input_mask']
+        segment_ids = sample_input['segment_ids']
+        return input_ids, input_mask, segment_ids
+
+    def flush_queries(self):
+        # Placeholder for actual query flush logic
+        pass
+
+# Usage example
+input_file = "path/to/dev-v1.1.json"  # Update this path to the actual SQuAD dataset file
+max_seq_length = 384
+doc_stride = 128
+max_query_length = 64
+
+preprocessor = SquadPreprocessor()
+input_ids, input_mask, segment_ids, eval_examples, eval_features = preprocessor.preprocess(
+    input_file, max_seq_length, doc_stride, max_query_length)
+
+qsl = get_squad_QSL(preprocessor)
+sut = SUT(qsl)
+
+# Sample query samples for testing
+query_samples = [{'index': 0, 'id': 100}, {'index': 1, 'id': 101}]
+
+# Issue queries and get processed samples
+for sample in query_samples:
+    input_ids, input_mask, segment_ids = sut.issue_queries([sample])
+    print(f"Query ID: {sample['id']}")
+    print(f"Input IDs: {input_ids}")
+    print(f"Input Mask: {input_mask}")
+    print(f"Segment IDs: {segment_ids}")
