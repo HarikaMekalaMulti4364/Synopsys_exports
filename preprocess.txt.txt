@@ -203,10 +203,17 @@ class SUT:
             'flush_func': flush_func
         }
 
-    def issue_queries(self, query_samples):
-        for i in range(len(query_samples)):
-            eval_features = self.qsl.get_features(query_samples[i]['index'])
-            self.process_sample(eval_features, query_samples[i]['id'])
+    def issue_queries(self, max_input):
+        results = []
+        start_idx = 0
+        while start_idx < len(self.qsl.eval_features):
+            end_idx = min(start_idx + max_input, len(self.qsl.eval_features))
+            query_samples = [{'index': i, 'id': i} for i in range(start_idx, end_idx)]
+            for sample in query_samples:
+                eval_features = self.qsl.get_features(sample['index'])
+                results.append(self.process_sample(eval_features, sample['id']))
+            start_idx = end_idx
+        return results
 
     def process_sample(self, sample_input, query_id=None):
         input_ids = sample_input['input_ids']
@@ -229,15 +236,12 @@ input_ids, input_mask, segment_ids, eval_examples, eval_features = preprocessor.
     input_file, max_seq_length, doc_stride, max_query_length)
 
 qsl = get_squad_QSL(preprocessor)
+
 sut = SUT(qsl)
 
-# Sample query samples for testing
-query_samples = [{'index': 0, 'id': 100}, {'index': 1, 'id': 101}]
+max_input = 2  # Example: You can set this to 1 or 2 to control how many samples to process in each iteration
+results = sut.issue_queries(max_input)
 
-# Issue queries and get processed samples
-for sample in query_samples:
-    input_ids, input_mask, segment_ids = sut.issue_queries([sample])
-    print(f"Query ID: {sample['id']}")
-    print(f"Input IDs: {input_ids}")
-    print(f"Input Mask: {input_mask}")
-    print(f"Segment IDs: {segment_ids}")
+for i, result in enumerate(results):
+    input_ids, input_mask, segment_ids = result
+    print(f"Query {i}: input_ids={input_ids}, input_mask={input_mask}, segment_ids={segment_ids}")
