@@ -1,1 +1,0 @@
-# Synopsys_exports
