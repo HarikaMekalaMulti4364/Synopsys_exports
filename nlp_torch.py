@@ -109,9 +109,9 @@ def write_predictions(all_examples, all_features, all_results, n_best_size, max_
                 output["end_logit"] = entry.end_logit
                 nbest_json.append(output)
 
-            res_predictions[example.qas_id] = nbest_json[0]["text"]
+            res_predictions.update({example.qas_id: nbest_json[0]["text"]})
 
-        all_predictions[f"res_{res_index}"] = res_predictions
+        all_predictions.update(res_predictions)
 
     with open(output_prediction_file, "w") as writer:
         writer.write(json.dumps(all_predictions, indent=4) + "\n")
