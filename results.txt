@@ -1,0 +1,10 @@
+{
+    "res_0": {
+        "56be4db0acb8001400a502ec": "Denver Broncos",
+        "56be4db0acb8001400a502ed": "Denver Broncos"
+    },
+    "res_1": {
+        "56be4db0acb8001400a502ec": "Carolina Panthers",
+        "56be4db0acb8001400a502ed": "Carolina Panthers"
+    }
+}
