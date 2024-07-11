@@ -1,0 +1,228 @@
+from __future__ import print_function
+from collections import Counter, defaultdict, namedtuple, OrderedDict
+import string
+import re
+import json
+import collections
+import math
+import six
+
+from nnac.core.log import Logger
+from transformers import BertTokenizer
+
+logger = Logger("Evaluation Classification")
+
+def get_final_text(pred_text, orig_text, do_lower_case):
+    """Project the tokenized prediction back to the original text."""
+    def _strip_spaces(text):
+        ns_chars = []
+        ns_to_s_map = OrderedDict()
+        for i, c in enumerate(text):
+            if c == " ":
+                continue
+            ns_to_s_map[len(ns_chars)] = i
+            ns_chars.append(c)
+        ns_text = "".join(ns_chars)
+        return ns_text, ns_to_s_map
+
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", do_lower_case=do_lower_case)
+    tok_text = " ".join(tokenizer.tokenize(orig_text))
+
+    start_position = tok_text.find(pred_text)
+    if start_position == -1:
+        return orig_text
+    end_position = start_position + len(pred_text) - 1
+
+    orig_ns_text, orig_ns_to_s_map = _strip_spaces(orig_text)
+    tok_ns_text, tok_ns_to_s_map = _strip_spaces(tok_text)
+
+    if len(orig_ns_text) != len(tok_ns_text):
+        return orig_text
+
+    tok_s_to_ns_map = {tok_index: i for i, tok_index in six.iteritems(tok_ns_to_s_map)}
+
+    orig_start_position = orig_ns_to_s_map.get(tok_s_to_ns_map.get(start_position))
+    orig_end_position = orig_ns_to_s_map.get(tok_s_to_ns_map.get(end_position))
+
+    if orig_start_position is None or orig_end_position is None:
+        return orig_text
+
+    return orig_text[orig_start_position:(orig_end_position + 1)]
+
+def _get_best_indexes(logits, n_best_size):
+    """Get the n-best logits from a list."""
+    return sorted(range(len(logits)), key=lambda i: logits[i], reverse=True)[:n_best_size]
+
+def _compute_softmax(scores):
+    """Compute softmax probability over raw logits."""
+    if not scores:
+        return []
+
+    max_score = max(scores)
+    exp_scores = [math.exp(score - max_score) for score in scores]
+    total_sum = sum(exp_scores)
+
+    return [score / total_sum for score in exp_scores]
+
+def normalize_answer(s):
+    """Lower text and remove punctuation, articles and extra whitespace."""
+    def remove_articles(text):
+        return re.sub(r'\b(a|an|the)\b', ' ', text)
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return ''.join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+def f1_score(prediction, ground_truth):
+    prediction_tokens = normalize_answer(prediction).split()
+    ground_truth_tokens = normalize_answer(ground_truth).split()
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = 1.0 * num_same / len(prediction_tokens)
+    recall = 1.0 * num_same / len(ground_truth_tokens)
+    return (2 * precision * recall) / (precision + recall)
+
+def exact_match_score(prediction, ground_truth):
+    return normalize_answer(prediction) == normalize_answer(ground_truth)
+
+def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
+    return max(metric_fn(prediction, ground_truth) for ground_truth in ground_truths)
+
+def write_predictions_and_evaluate(all_examples, all_features, all_results, n_best_size, max_answer_length, do_lower_case, dataset, max_examples=None):
+    """Write final predictions and evaluate them."""
+    logger.info("Evaluating predictions")
+
+    example_index_to_features = defaultdict(list)
+    for feature in all_features:
+        example_index_to_features[feature.example_index].append(feature)
+
+    unique_id_to_result = {result.unique_id: result for result in all_results}
+
+    PrelimPrediction = namedtuple("PrelimPrediction", ["feature_index", "start_index", "end_index", "start_logit", "end_logit"])
+    NbestPrediction = namedtuple("NbestPrediction", ["text", "start_logit", "end_logit"])
+
+    all_predictions = OrderedDict()
+
+    for example_index, example in enumerate(all_examples):
+        if max_examples and example_index >= max_examples:
+            break
+
+        features = example_index_to_features[example_index]
+        prelim_predictions = []
+
+        for feature_index, feature in enumerate(features):
+            result = unique_id_to_result.get(feature.unique_id)
+            if result is None:
+                continue
+
+            start_indexes = _get_best_indexes(result.start_logits, n_best_size)
+            end_indexes = _get_best_indexes(result.end_logits, n_best_size)
+
+            for start_index in start_indexes:
+                for end_index in end_indexes:
+                    if start_index >= len(feature.tokens) or end_index >= len(feature.tokens):
+                        continue
+                    if start_index not in feature.token_to_orig_map or end_index not in feature.token_to_orig_map:
+                        continue
+                    if not feature.token_is_max_context.get(start_index, False):
+                        continue
+                    if end_index < start_index or end_index - start_index + 1 > max_answer_length:
+                        continue
+
+                    prelim_predictions.append(
+                        PrelimPrediction(
+                            feature_index=feature_index,
+                            start_index=start_index,
+                            end_index=end_index,
+                            start_logit=result.start_logits[start_index],
+                            end_logit=result.end_logits[end_index]
+                        )
+                    )
+
+        prelim_predictions = sorted(prelim_predictions, key=lambda x: (x.start_logit + x.end_logit), reverse=True)
+
+        seen_predictions = {}
+        nbest = []
+
+        for pred in prelim_predictions:
+            if len(nbest) >= n_best_size:
+                break
+
+            feature = features[pred.feature_index]
+            tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
+            orig_doc_start = feature.token_to_orig_map[pred.start_index]
+            orig_doc_end = feature.token_to_orig_map[pred.end_index]
+            orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+            tok_text = " ".join(tok_tokens).replace(" ##", "").replace("##", "").strip()
+            tok_text = " ".join(tok_text.split())
+            orig_text = " ".join(orig_tokens)
+
+            final_text = get_final_text(tok_text, orig_text, do_lower_case)
+            if final_text in seen_predictions:
+                continue
+
+            seen_predictions[final_text] = True
+            nbest.append(NbestPrediction(text=final_text, start_logit=pred.start_logit, end_logit=pred.end_logit))
+
+        if not nbest:
+            nbest.append(NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
+
+        all_predictions[example.qas_id] = nbest[0].text
+
+    # Evaluate predictions
+    f1 = exact_match = total = 0
+    for article in dataset:
+        if max_examples and total >= max_examples:
+            break
+        for paragraph in article['paragraphs']:
+            if max_examples and total >= max_examples:
+                break
+            for qa in paragraph['qas']:
+                if max_examples and total >= max_examples:
+                    break
+                total += 1
+
+                if qa['id'] not in all_predictions:
+                    logger.error(f"Unanswered question {qa['id']} will receive score 0.")
+                    continue
+                ground_truths = list(map(lambda x: x['text'], qa['answers']))
+                prediction = all_predictions[qa['id']]
+                exact_match += metric_max_over_ground_truths(exact_match_score, prediction, ground_truths)
+                f1 += metric_max_over_ground_truths(f1_score, prediction, ground_truths)
+
+    exact_match = 100.0 * exact_match / total
+    f1 = 100.0 * f1 / total
+
+    logger.info(f"Evaluation Results:\nExact Match: {exact_match:.2f}%\nF1 Score: {f1:.2f}%")
+
+    return {'exact_match': exact_match, 'f1': f1}
+
+def nlp(results_out, dataset_file, max_examples=None):
+    RawResult = namedtuple("RawResult", ["unique_id", "start_logits", "end_logits"])
+
+    tensor_results = []
+    for res_pred in results_out:
+        for res, pred in res_pred.items():
+            start_logits, end_logits, max_examples, eval_examples, eval_features = pred
+            for idx, feature in enumerate(eval_features):
+                tensor_results.append(RawResult(
+                    unique_id=feature.unique_id,
+                    start_logits=start_logits[0].tolist(),
+                    end_logits=end_logits[0].tolist()
+                ))
+
+    with open(dataset_file) as f:
+        dataset_json = json.load(f)
+        dataset = dataset_json['data']
+
+    return write_predictions_and_evaluate(eval_examples, eval_features, tensor_results, 20, 30, True, dataset, max_examples)
