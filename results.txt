@@ -8,3 +8,5 @@
         "56be4db0acb8001400a502ed": "Carolina Panthers"
     }
 }
+
+accuracy --model_path am/examples/public_models/BERT_Large/nnac_out/onnx/bert_large_optimized.onnx --inputs ${DATASET}/ --reference_data ${DATASET}/dev-v1DIR}/model_data/preprocess.py --postprocessing ${EXAMPLE_DIR}/model_data/postprocess.py --metric nlp --cpu_cores 10 --max_input 12 2>&1 | tee output.txt
