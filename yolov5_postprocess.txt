@@ -1,0 +1,62 @@
+def postprocess(output, original_image, resize_ratio, conf_threshold=0.25, iou_threshold=0.45, coco_ids=None):
+    """
+    Postprocess the output from the YOLOv5 model.
+
+    Parameters:
+    - output (torch.Tensor): Raw output from the model, shape (1, 72828, 85).
+    - original_image (numpy.ndarray): Original image before preprocessing.
+    - resize_ratio (float): Resize ratio used during preprocessing.
+    - conf_threshold (float): Confidence threshold for filtering detections.
+    - iou_threshold (float): IOU threshold for non-max suppression.
+    - coco_ids (list): List of COCO category IDs.
+
+    Returns:
+    - results (list): List of dictionaries containing detection results.
+    """
+    import torch
+    from torchvision.ops import nms
+    
+    if coco_ids is None:
+        coco_ids = list(range(80))  # Assuming 80 classes by default
+
+    results = []
+    h, w, _ = original_image.shape
+    
+    # Extract the detections from the output
+    output = output[0]  # Remove batch dimension
+    boxes = output[:, :4]
+    object_conf = output[:, 4]
+    class_probs = output[:, 5:]
+
+    # Calculate the final scores
+    scores, labels = torch.max(class_probs, dim=1)
+    scores *= object_conf
+
+    # Apply confidence threshold
+    valid_indices = scores > conf_threshold
+    boxes = boxes[valid_indices]
+    scores = scores[valid_indices]
+    labels = labels[valid_indices]
+
+    # Rescale boxes to the original image size
+    boxes /= resize_ratio
+
+    # Perform non-max suppression
+    keep = nms(boxes, scores, iou_threshold)
+    boxes = boxes[keep]
+    scores = scores[keep]
+    labels = labels[keep]
+
+    for score, bbox, class_id in zip(scores, boxes, labels):
+        entry = {
+            "category_id": coco_ids[int(class_id)],
+            "score": float(score),
+            "bbox": [float(coord) for coord in bbox.tolist()]  # Convert to list and float
+        }
+        results.append(entry)
+
+    return results
+
+# Example usage:
+# Assuming `output` is the tensor obtained from the YOLOv5 model, `original_img` is the original image, and `resize_ratio` is the resize ratio from preprocessing
+# results = postprocess(output, original_img, resize_ratio)
