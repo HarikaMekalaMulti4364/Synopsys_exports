@@ -1,0 +1,32 @@
+# Use an official Python runtime as a parent image
+FROM python:3.9-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the current directory contents into the container at /app
+COPY . /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the dependencies from requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install PyTorch, Torchvision, and other specified packages
+RUN pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118 \
+    mmcv-full==1.7.0 \
+    mmdet==2.26.0 \
+    mmsegmentation==0.30.0
+
+# Upgrade pip and install openmim and mmengine
+RUN pip install --no-cache-dir -U openmim && \
+    mim install mmengine && \
+    pip install --no-cache-dir mmcv==2.0.0rc4
+
+# Specify the command to run on container start
+CMD ["python", "your_script.py"]
